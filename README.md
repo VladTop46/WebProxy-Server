@@ -18,7 +18,7 @@
 
 1. Склонируйте репозиторий:
 
-```git clone https://github.com/username/repository.git```
+```git clone https://github.com/VladTop46/WebProxy-Server.git```
 
 
 2. Перейдите в каталог с проектом:
