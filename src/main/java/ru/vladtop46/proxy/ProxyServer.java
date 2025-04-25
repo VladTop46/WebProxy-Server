@@ -1,242 +1,206 @@
 package ru.vladtop46.proxy;
 
-import java.io.*;
-import java.net.*;
-import java.text.SimpleDateFormat;
-import java.time.LocalDateTime;
-import java.util.Date;
-import java.util.Locale;
+import ru.vladtop46.proxy.config.ProxyConfig;
+import ru.vladtop46.proxy.handler.ProxyHandlerFactory;
+import ru.vladtop46.proxy.logging.ProxyLogger;
+import ru.vladtop46.proxy.security.AccessControl;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class ProxyServer {
-    private static final int PROXY_PORT = 8023; // Замените на нужный порт
-    private static BufferedWriter logWriter;
-    private static String currentLogDate;
-    private static int logFileIndex = 1;
+    private final String configPath;
+    private final AtomicReference<ProxyConfig> configRef;
+    private final ProxyLogger logger;
+    private final ProxyHandlerFactory handlerFactory;
+    private AccessControl accessControl;
+    private final AtomicBoolean running = new AtomicBoolean(true);
+    private long lastConfigModTime = 0;
 
-    public static void main(String[] args) {
+    // Интервал проверки обновлений конфига (в миллисекундах)
+    private static final long CONFIG_CHECK_INTERVAL = 10000; // 10 секунд
+
+    // Флаг для настройки автоматического обновления конфига
+    private boolean autoReloadConfig = false;
+
+    public ProxyServer(String configPath) {
+        this.configPath = configPath;
+        ProxyConfig initialConfig = ProxyConfig.loadConfig(configPath);
+        this.configRef = new AtomicReference<>(initialConfig);
+        this.logger = new ProxyLogger(initialConfig.getServer().getLogsDirectory());
+        this.handlerFactory = new ProxyHandlerFactory(configRef);
+        this.accessControl = new AccessControl(initialConfig);
+
         try {
-            initializeLogFile();
-            ServerSocket serverSocket = new ServerSocket(PROXY_PORT);
-            logMessage(String.format("Proxy server is running on port: %d", PROXY_PORT));
-            System.out.println(String.format("Proxy server is running on port: %d", PROXY_PORT));
-
-            while (true) {
-                Socket clientSocket = serverSocket.accept();
-                InetAddress clientAddress = clientSocket.getInetAddress();
-                LocalDateTime currentTime = LocalDateTime.now();
-                logMessage(String.format("Client connected - IP: %s, Time: %s, Message: Connected to Proxy",
-                        clientAddress.getHostAddress(), currentTime));
-                System.out.println(String.format("Client connected - IP: %s, Time: %s, Message: Connected to Proxy",
-                        clientAddress.getHostAddress(), currentTime));
-
-                new Thread(new ProxyHandler(clientSocket)).start();
+            Path path = Paths.get(configPath);
+            if (Files.exists(path)) {
+                this.lastConfigModTime = Files.getLastModifiedTime(path).toMillis();
             }
-        } catch (IOException e) {
-            logMessage("Error: " + e.getMessage());
+        } catch (Exception e) {
+            logger.log("Error getting config file modification time: " + e.getMessage());
         }
     }
 
-    private static void initializeLogFile() throws IOException {
-        String logDir = "logs";
-        java.nio.file.Files.createDirectories(java.nio.file.Paths.get(logDir));
-
-        SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
-        currentLogDate = dateFormat.format(new Date());
-
-        logFileIndex = getNextLogFileIndex(logDir, currentLogDate);
-
-        String logFileName = String.format("%s/webproxy-%s-%d.log", logDir, currentLogDate, logFileIndex);
-        logWriter = new BufferedWriter(new FileWriter(logFileName, true));
-
-        logMessage(String.format("Log file initialized: %s", logFileName));
-    }
-
-    private static int getNextLogFileIndex(String logDir, String currentDate) {
-        String prefix = String.format("webproxy-%s-", currentDate);
-        int maxIndex = 0;
-
-        try (java.util.stream.Stream<String> files = java.nio.file.Files.list(java.nio.file.Paths.get(logDir)).map(path -> path.getFileName().toString())) {
-            maxIndex = files.filter(file -> file.startsWith(prefix))
-                    .map(file -> file.replace(prefix, "").replace(".log", ""))
-                    .mapToInt(num -> {
-                        try {
-                            return Integer.parseInt(num);
-                        } catch (NumberFormatException e) {
-                            return 0;
-                        }
-                    })
-                    .max()
-                    .orElse(0);
-        } catch (IOException e) {
-            System.err.println("Error reading log files: " + e.getMessage());
-        }
-
-        return maxIndex + 1;
-    }
-
-    private static synchronized void logMessage(String message) {
+    public void start() {
         try {
-            logWriter.write(message);
-            logWriter.newLine();
-            logWriter.flush();
-        } catch (IOException e) {
-            System.err.println("Error writing to log file: " + e.getMessage());
-        }
-    }
+            // Запускаем поток для прослушивания команд консоли
+            startCommandListener();
 
-    private static class ProxyHandler implements Runnable {
-        private static final int BUFFER_SIZE = 8192; // Или любое другое значение
-        private final Socket clientSocket;
+            // Запускаем поток для проверки изменений конфига
+            if (autoReloadConfig) {
+                startConfigWatcher();
+            }
 
-        public ProxyHandler(Socket clientSocket) {
-            this.clientSocket = clientSocket;
-        }
+            ProxyConfig config = configRef.get();
+            ServerSocket serverSocket = new ServerSocket(config.getServer().getPort());
+            logger.log(String.format("Proxy server is running on port: %d", config.getServer().getPort()));
+            logger.log("Type 'reload' to reload configuration or 'exit' to stop the server");
 
-        @Override
-        public void run() {
-            try {
-                BufferedReader clientReader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-                BufferedWriter clientWriter = new BufferedWriter(new OutputStreamWriter(clientSocket.getOutputStream()));
-
-                // Чтение первой строки (заголовок запроса)
-                String requestLine = clientReader.readLine();
-
-                if (requestLine == null || requestLine.isEmpty()) {
-                    return;
-                }
-
-                String[] requestParts = requestLine.split(" ");
-                if (requestParts.length != 3) {
-                    return;
-                }
-
-                String method = requestParts[0];
-                String url = requestParts[1];
-
-                // Обработка метода CONNECT для HTTPS
-                if ("CONNECT".equalsIgnoreCase(method)) {
-                    handleConnectMethod(url, clientWriter, clientReader);
-                } else {
-                    handleHttpMethod(requestLine, clientReader, clientWriter);
-                }
-            } catch (IOException e) {
-                logMessage("Error in ProxyHandler: " + e.getMessage());
-            } finally {
+            while (running.get()) {
                 try {
-                    clientSocket.close();
-                } catch (IOException e) {
-                    logMessage("Error closing client socket: " + e.getMessage());
+                    // Установка таймаута для возможности проверки флага running
+                    serverSocket.setSoTimeout(1000);
+                    Socket clientSocket = serverSocket.accept();
+
+                    // Проверка доступа по IP
+                    if (!accessControl.isIpAllowed(clientSocket.getInetAddress())) {
+                        logger.log(String.format("Access denied for IP: %s",
+                                clientSocket.getInetAddress().getHostAddress()));
+                        clientSocket.close();
+                    } else {
+                        // Создаем новый поток обработки только для разрешенных соединений
+                        new Thread(handlerFactory.createHandler(clientSocket)).start();
+                    }
+                } catch (java.net.SocketTimeoutException e) {
+                    // Игнорируем таймаут - это нормально, позволяет проверить флаг running
+                } catch (Exception e) {
+                    if (running.get()) {
+                        logger.log("Connection error: " + e.getMessage());
+                    }
                 }
             }
+
+            serverSocket.close();
+            logger.log("Server stopped");
+
+        } catch (Exception e) {
+            logger.log("Server error: " + e.getMessage());
         }
+    }
 
-        private void handleConnectMethod(String url, BufferedWriter clientWriter, BufferedReader clientReader) {
-            String[] urlParts = url.split(":");
-            String host = urlParts[0];
-            int port = (urlParts.length > 1) ? Integer.parseInt(urlParts[1]) : 443;
+    /**
+     * Метод для перезагрузки конфигурации
+     */
+    public void reloadConfig() {
+        try {
+            ProxyConfig newConfig = ProxyConfig.loadConfig(configPath);
+            configRef.set(newConfig);
 
-            try (Socket serverSocket = new Socket(host, port)) {
-                clientWriter.write("HTTP/1.1 200 Connection Established\r\n");
-                clientWriter.write("Proxy-Agent: ProxyServer\r\n");
-                clientWriter.write("\r\n");
-                clientWriter.flush();
+            // Обновляем AccessControl с новой конфигурацией
+            this.accessControl = new AccessControl(newConfig);
 
-                InputStream clientInput = clientSocket.getInputStream();
-                OutputStream clientOutput = clientSocket.getOutputStream();
-                InputStream serverInput = serverSocket.getInputStream();
-                OutputStream serverOutput = serverSocket.getOutputStream();
+            // Уведомляем фабрику обработчиков об обновлении конфигурации
+            handlerFactory.updateAccessControl();
 
-                Thread clientToServer = new Thread(() -> transferData(clientInput, serverOutput));
-                Thread serverToClient = new Thread(() -> transferData(serverInput, clientOutput));
-
-                clientToServer.start();
-                serverToClient.start();
-
-                clientToServer.join();
-                serverToClient.join();
-            } catch (IOException | InterruptedException e) {
-                logMessage("Error in handleConnectMethod: " + e.getMessage());
+            // Обновление последнего времени модификации
+            Path path = Paths.get(configPath);
+            if (Files.exists(path)) {
+                this.lastConfigModTime = Files.getLastModifiedTime(path).toMillis();
             }
+
+            logger.log("Configuration reloaded successfully");
+        } catch (Exception e) {
+            logger.log("Error reloading configuration: " + e.getMessage());
         }
+    }
 
-        private void handleHttpMethod(String requestLine, BufferedReader clientReader, BufferedWriter clientWriter) {
-            try (Socket serverSocket = new Socket()) {
-                BufferedWriter serverWriter = new BufferedWriter(new OutputStreamWriter(serverSocket.getOutputStream()));
-                BufferedReader serverReader = new BufferedReader(new InputStreamReader(serverSocket.getInputStream()));
+    /**
+     * Запускает отдельный поток для прослушивания команд из консоли
+     */
+    private void startCommandListener() {
+        Thread commandThread = new Thread(() -> {
+            BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
+            try {
+                while (running.get()) {
+                    if (reader.ready()) {
+                        String command = reader.readLine().trim().toLowerCase();
+                        processCommand(command);
+                    }
+                    Thread.sleep(100); // Небольшая задержка чтобы не загружать CPU
+                }
+            } catch (Exception e) {
+                logger.log("Command listener error: " + e.getMessage());
+            }
+        });
+        commandThread.setDaemon(true);
+        commandThread.start();
+    }
 
-                // Извлечение хоста и порта из заголовков
-                String host = null;
-                int port = 80;
-                String line;
-                while ((line = clientReader.readLine()) != null && !line.isEmpty()) {
-                    if (line.toLowerCase(Locale.ROOT).startsWith("host:")) {
-                        String hostPart = line.split(" ")[1];
-                        String[] hostParts = hostPart.split(":");
-                        host = hostParts[0];
-                        if (hostParts.length > 1) {
-                            try {
-                                port = Integer.parseInt(hostParts[1]);
-                            } catch (NumberFormatException e) {
-                                port = 80; // Используем порт по умолчанию
+    /**
+     * Обрабатывает команды консоли
+     */
+    private void processCommand(String command) {
+        switch (command) {
+            case "reload":
+                logger.log("Reloading configuration...");
+                reloadConfig();
+                break;
+            case "exit":
+                logger.log("Stopping server...");
+                running.set(false);
+                break;
+            case "status":
+                logger.log("Server is running. Current config: " + configPath);
+                break;
+            case "help":
+                logger.log("Available commands: reload, exit, status, help");
+                break;
+            default:
+                logger.log("Unknown command. Type 'help' for available commands");
+                break;
+        }
+    }
+
+    /**
+     * Запускает поток для проверки изменений конфигурационного файла
+     */
+    private void startConfigWatcher() {
+        Thread watcherThread = new Thread(() -> {
+            try {
+                while (running.get()) {
+                    try {
+                        Path path = Paths.get(configPath);
+                        if (Files.exists(path)) {
+                            long currentModTime = Files.getLastModifiedTime(path).toMillis();
+                            if (currentModTime > lastConfigModTime) {
+                                logger.log("Configuration file was modified, reloading...");
+                                reloadConfig();
                             }
                         }
-                    }
-                }
-
-                // Если хост не найден в заголовках, извлечем его из URL
-                if (host == null) {
-                    try {
-                        URL parsedUrl = new URL(requestLine.split(" ")[1]);
-                        host = parsedUrl.getHost();
-                        if (parsedUrl.getPort() != -1) {
-                            port = parsedUrl.getPort();
-                        }
                     } catch (Exception e) {
-                        logMessage("Invalid URL: " + requestLine.split(" ")[1]);
-                        return;
+                        logger.log("Error checking config file: " + e.getMessage());
                     }
+
+                    Thread.sleep(CONFIG_CHECK_INTERVAL);
                 }
-
-                // Соединяемся с удаленным сервером
-                serverSocket.connect(new InetSocketAddress(host, port));
-
-                // Переписываем первый запрос клиента на сервер
-                serverWriter.write(requestLine);
-                serverWriter.newLine();
-
-                // Переписываем остальные заголовки
-                while ((line = clientReader.readLine()) != null && !line.isEmpty()) {
-                    if (!line.toLowerCase(Locale.ROOT).startsWith("proxy-connection")) {
-                        serverWriter.write(line);
-                        serverWriter.newLine();
-                    }
-                }
-                serverWriter.newLine();
-                serverWriter.flush();
-
-                // Переписываем ответ сервера клиенту
-                char[] buffer = new char[BUFFER_SIZE];
-                int bytesRead;
-                while ((bytesRead = serverReader.read(buffer)) != -1) {
-                    clientWriter.write(buffer, 0, bytesRead);
-                    clientWriter.flush();
-                }
-            } catch (IOException e) {
-                logMessage("Error in handleHttpMethod: " + e.getMessage());
+            } catch (InterruptedException e) {
+                // Thread interrupted, exit
             }
-        }
+        });
+        watcherThread.setDaemon(true);
+        watcherThread.start();
+        logger.log("Config watcher started (interval: " + (CONFIG_CHECK_INTERVAL / 1000) + " seconds)");
+    }
 
-        private void transferData(InputStream input, OutputStream output) {
-            try {
-                byte[] buffer = new byte[BUFFER_SIZE];
-                int bytesRead;
-                while ((bytesRead = input.read(buffer)) != -1) {
-                    output.write(buffer, 0, bytesRead);
-                    output.flush();
-                }
-            } catch (IOException e) {
-                logMessage("Error in transferData: " + e.getMessage());
-            }
-        }
+    public static void main(String[] args) {
+        String configPath = args.length > 0 ? args[0] : "config.yml";
+        new ProxyServer(configPath).start();
     }
 }
